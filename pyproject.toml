@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpplcom"
+version = "0.1.0"
+description = "LCOM4 class cohesion for C++ codebases"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Ulf Hammarqvist" }]
+dependencies = ["clang>=17"]
+
+[project.scripts]
+cpplcom = "cpplcom.cli:main"
+
+[tool.setuptools]
+packages = ["cpplcom"]
