@@ -196,8 +196,15 @@ def on_self(node: ci.Cursor, self_param: ci.Cursor | None, members: dict[str, li
     return candidates
 
 
-def uses_of(body: ci.Cursor, class_usr: str, members: dict[str, list[ci.Cursor]]) -> tuple[set[str], set[str], bool]:
-    fields, calls, writes = set(), set(), False
+def is_qualified(node: ci.Cursor) -> bool:
+    tokens = [t.spelling for t in node.get_tokens()]
+    return len(tokens) >= 2 and tokens[-2] == "::"
+
+
+def uses_of(body: ci.Cursor, class_usr: str, members: dict[str, list[ci.Cursor]]):
+    """The class's fields a method uses, the methods it calls (and which of those calls are qualified, so not
+    dispatched virtually), and whether it may write a field."""
+    fields, calls, qualified, writes = set(), set(), set(), False
     self_param = self_parameter(body) if body.is_static_method() else None
     for node, parents in walk_with_parents(body):
         if node.kind not in (ci.CursorKind.MEMBER_REF_EXPR, ci.CursorKind.DECL_REF_EXPR, ci.CursorKind.CALL_EXPR,
@@ -210,7 +217,9 @@ def uses_of(body: ci.Cursor, class_usr: str, members: dict[str, list[ci.Cursor]]
                 writes = writes or not only_read(parents)
             elif decl.kind in METHOD_KINDS and is_method(decl):
                 calls.add(template_of(decl).canonical.get_usr())
-    return fields, calls, writes
+                if node.kind != ci.CursorKind.CALL_EXPR and is_qualified(node):
+                    qualified.add(template_of(decl).canonical.get_usr())
+    return fields, calls, qualified, writes
 
 
 @functools.lru_cache(maxsize=None)
@@ -219,14 +228,17 @@ def in_scope(path: str, root: str, excludes: tuple[str, ...]) -> bool:
     return path.startswith(root) and not any(fnmatch.fnmatch(path, pattern) for pattern in excludes)
 
 
-def methods_in(cursor: ci.Cursor, root: str, excludes: tuple[str, ...]):
+def declarations_in(cursor: ci.Cursor, root: str, excludes: tuple[str, ...]):
+    """Counted methods and class definitions in scope."""
     for child in cursor.get_children():
         if child.location.file and not in_scope(child.location.file.name, root, excludes):
             continue
         if is_counted_method(child):
             yield child
         elif child.kind in SCOPE_KINDS:
-            yield from methods_in(child, root, excludes)
+            if child.kind in CLASS_KINDS and child.is_definition():
+                yield child
+            yield from declarations_in(child, root, excludes)
 
 
 def analyse(entry: dict, root: str, excludes: tuple[str, ...], libclang: str, includes: list[str]) -> dict:
@@ -236,7 +248,11 @@ def analyse(entry: dict, root: str, excludes: tuple[str, ...], libclang: str, in
     tu = ci.Index.create().parse(entry["file"], args=arguments_of(entry) + includes)
     errors = [str(d) for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error]
     classes: dict[str, dict] = {}
-    for cursor in methods_in(tu.cursor, root, excludes):
+    bases: dict[str, list[str]] = {}
+    for cursor in declarations_in(tu.cursor, root, excludes):
+        if cursor.kind in CLASS_KINDS:
+            bases[cursor.canonical.get_usr()] = bases_of(cursor)
+            continue
         class_usr = owner_usr(cursor)
         if class_usr is None:
             continue
@@ -245,12 +261,12 @@ def analyse(entry: dict, root: str, excludes: tuple[str, ...], libclang: str, in
             "name": qualified_name(definition),
             "location": f"{os.path.realpath(definition.location.file.name)}:{definition.location.line}",
             "fields": sorted(f.spelling for f in definition.get_children() if f.kind == ci.CursorKind.FIELD_DECL),
-            "bases": bases_of(definition), "methods": {}})
-        fields, calls, writes = uses_of(cursor, class_usr, members_by_name(definition))
+            "methods": {}})
+        fields, calls, qualified, writes = uses_of(cursor, class_usr, members_by_name(definition))
         cls["methods"][template_of(cursor).canonical.get_usr()] = {
-            "name": cursor.spelling, "fields": sorted(fields), "calls": sorted(calls),
+            "name": cursor.spelling, "fields": sorted(fields), "calls": sorted(calls), "qualified": sorted(qualified),
             "overrides": overridden_by(cursor), "reads_only": cursor.is_const_method() or not writes}
-    return {"file": entry["file"], "errors": errors, "classes": classes}
+    return {"file": entry["file"], "errors": errors, "classes": classes, "bases": bases}
 
 
 def qualified_name(cursor: ci.Cursor) -> str:
@@ -262,40 +278,48 @@ def qualified_name(cursor: ci.Cursor) -> str:
     return "::".join(reversed(parts))
 
 
-def merge(results: list[dict]) -> dict[str, dict]:
+def merge(results: list[dict]) -> tuple[dict[str, dict], dict[str, list[str]]]:
     classes: dict[str, dict] = {}
+    bases: dict[str, list[str]] = {}
     for result in results:
+        bases.update(result["bases"])
         for usr, cls in result["classes"].items():
             classes.setdefault(usr, {**cls, "methods": {}})["methods"].update(cls["methods"])
-    return classes
+    return classes, bases
 
 
-def base_chain(class_usr: str, classes: dict[str, dict]) -> set[str]:
-    chain, todo = set(), list(classes[class_usr]["bases"])
+def base_chain(class_usr: str, bases: dict[str, list[str]]) -> set[str]:
+    chain, todo = set(), list(bases.get(class_usr, []))
     while todo:
         base = todo.pop()
-        if base not in chain and base in classes:
+        if base not in chain:
             chain.add(base)
-            todo += classes[base]["bases"]
+            todo += bases.get(base, [])
     return chain
 
 
-def dispatched(class_usr: str, classes: dict[str, dict]) -> dict[str, set[str]]:
-    """For each method, the class's own overrides that its calls into base classes reach."""
-    bases = base_chain(class_usr, classes)
-    owner = {usr: base for base in bases for usr in classes[base]["methods"]}
+def dispatched(class_usr: str, classes: dict[str, dict], bases: dict[str, list[str]]) -> dict[str, set[str]]:
+    """For each method, the class's own overrides that its calls into base classes reach. A virtual call to one of
+    them runs the override, not the base body; a qualified Base::f() runs the base body, not the override."""
+    chain = base_chain(class_usr, bases)
+    owner = {usr: base for base in chain if base in classes for usr in classes[base]["methods"]}
     methods = classes[class_usr]["methods"]
     override_of = {base_usr: usr for usr, method in methods.items() for base_usr in method["overrides"]}
     reached = {}
     for usr, method in methods.items():
-        seen, todo = set(), [c for c in method["calls"] if c in owner or c in override_of]
+        found, seen = set(), set()
+        todo = [(callee, callee in method["qualified"]) for callee in method["calls"]]
         while todo:
-            callee = todo.pop()
-            if callee not in seen:
-                seen.add(callee)
-                if callee in owner:
-                    todo += classes[owner[callee]]["methods"][callee]["calls"]
-        reached[usr] = {override_of[c] for c in seen if c in override_of}
+            callee, qualified = todo.pop()
+            if (callee, qualified) in seen:
+                continue
+            seen.add((callee, qualified))
+            if callee in override_of and not qualified:
+                found.add(override_of[callee])
+            elif callee in owner:
+                body = classes[owner[callee]]["methods"][callee]
+                todo += [(c, c in body["qualified"]) for c in body["calls"]]
+        reached[usr] = found
     return reached
 
 
@@ -329,13 +353,13 @@ def is_bare(method: dict) -> bool:
     return not method["fields"] or method["reads_only"]
 
 
-def score(classes: dict[str, dict]) -> list[dict]:
+def score(classes: dict[str, dict], bases: dict[str, list[str]]) -> list[dict]:
     rows = []
     for class_usr, cls in classes.items():
         methods = cls["methods"]
         if len(methods) < 2:
             continue
-        parts = components(methods, dispatched(class_usr, classes))
+        parts = components(methods, dispatched(class_usr, classes, bases))
         bare = sum(1 for part in parts if len(part) == 1 and is_bare(methods[part[0]]))
         rows.append({
             "class": cls["name"], "location": cls["location"], "lcom4": len(parts), "bare": bare,
@@ -390,7 +414,7 @@ def main() -> int:
     errors = [(r["file"], e) for r in results for e in r["errors"]]
     for file, error in errors:
         print(f"parse error in {file}: {error}", file=sys.stderr)
-    rows = score(merge(results))
+    rows = score(*merge(results))
     print(report(rows, root, args.threshold))
     if args.json:
         args.json.write_text(json.dumps(rows, indent=1))

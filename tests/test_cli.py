@@ -76,6 +76,41 @@ private:
   int _w = 0;
 };
 
+struct Root { virtual ~Root() = default; void update() { apply(); } virtual void apply() = 0; };
+struct Middle : Root { int middle = 0; };
+
+class Deep : public Middle {
+public:
+  void resume() { info = 1; update(); }
+  void apply() override { gain = 2; }
+  int process() { return gain; }
+private:
+  int info = 0, gain = 0;
+};
+
+struct Stepper { virtual ~Stepper() = default; void run() { step(); } virtual void step() { tick(); } virtual void tick() {} };
+
+class Overridden : public Stepper {
+public:
+  void start() { _a = 1; run(); }
+  void step() override { _a = 2; }
+  void tick() override { _b = 1; }
+  int b() { return _b; }
+private:
+  int _a = 0, _b = 0;
+};
+
+struct Ticker { virtual ~Ticker() = default; virtual void tick() {} };
+
+class Qualified : public Ticker {
+public:
+  void start() { _a = 1; Ticker::tick(); }
+  void tick() override { _b = 1; }
+  int b() { return _b; }
+private:
+  int _a = 0, _b = 0;
+};
+
 class ExplicitSelf {
 public:
   void run() { helper(*this, 2); }
@@ -134,6 +169,9 @@ class CliTest(unittest.TestCase):
         self.assertEqual(jobs["Host"], (1, 2, 1), "a lone method using fields only through const calls is bare")
         self.assertEqual(jobs["Writer"], (2, 2, 0), "a lone method that writes is a job")
         self.assertEqual(jobs["ExplicitSelf"], (2, 2, 0), "self.step(n) joins step(int), not step()")
+        self.assertEqual(jobs["Deep"], (1, 1, 0), "dispatch is followed through a base with no methods of its own")
+        self.assertEqual(jobs["Overridden"], (2, 2, 0), "an overridden base body never runs, so its calls join nothing")
+        self.assertEqual(jobs["Qualified"], (2, 2, 0), "Base::tick() runs the base body, not the override")
         self.assertIn(["c", "d"], rows["Split"]["components"], "an out-of-line definition is the same method")
         self.assertNotIn("Vendored", rows, "vendor/ is excluded by default")
         self.assertEqual(code, 1)
